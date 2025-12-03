@@ -7,11 +7,16 @@ import gdown
 import os
 import cv2
 import numpy as np
+from glob import glob
+import torch
+import cv2
 #import torch
 
 
 PROJECT_ID = 'erebus-469901'
 DATASET = 'COPERNICUS/S2_SR_HARMONIZED'
+#DATASET ='DLR/WSF/WSF2015/v1'
+#DATASET = 'JRC/GHSL/P2023A/GHS_BUILT_C'
 LOCALIMAGEPATH = './my_aoi_image.tif'
 #defined rectangle area
 SW = {'lat': float('69.47064973844004'), 'long': float('-98.39302540719589')}
@@ -36,50 +41,111 @@ def define_area():
 
 
 def load_sentinel_imagery(aoi):
-# Assuming ee is initialized and aoi is defined
-# Load Sentinel-2 Surface Reflectance data
-    sentinel_collection = ee.ImageCollection(DATASET) \
-        .filterBounds(aoi) \
-        .filterDate('2023-06-01', '2023-08-01') \
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    dataset_id = DATASET
+    print(f"Loading dataset: {dataset_id}")
 
-    # Take median to reduce clouds/noise
-    sentinel_image = sentinel_collection.median().clip(aoi)
+    collection = ee.ImageCollection(dataset_id).filterBounds(aoi)
 
-    #return image(s)
-    return sentinel_image
+    # Handle Sentinel-2 vs other datasets differently
+    if "COPERNICUS/S2" in dataset_id:
+        collection = (collection
+                      .filterDate('2023-06-01', '2023-08-01')
+                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)))
+        image = collection.median().clip(aoi)
+
+    elif "COPERNICUS/S1" in dataset_id:
+        collection = (collection
+                      .filterDate('2023-06-01', '2023-08-01')
+                      .filter(ee.Filter.eq('instrumentMode', 'IW')))
+        image = collection.mean().clip(aoi)
+
+    else:
+        # Non-Sentinel datasets (GHSL, MODIS, etc.)
+        image = ee.ImageCollection(dataset_id).filterBounds(aoi).mean().clip(aoi)
+
+    # Print available bands for debugging
+    try:
+        print("Available bands:", image.bandNames().getInfo())
+    except Exception as e:
+        print("⚠️ Could not retrieve band names:", e)
+
+    return image
 
 
 
 def visualize(sentinel_image):
-    Map = geemap.Map(center=[(SW['lat'] + NE['lat'])/2, (SW['long'] + NE['long'])/2], zoom=10)
-    Map.addLayer(sentinel_image, {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000}, 'Sentinel-2 RGB')
+    Map = geemap.Map(center=[(SW['lat'] + NE['lat']) / 2,
+                             (SW['long'] + NE['long']) / 2],
+                     zoom=8)
+
+    bands = sentinel_image.bandNames().getInfo()
+    if set(['B4', 'B3', 'B2']).issubset(bands):
+        vis_params = {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000}
+    else:
+        vis_params = {'min': 0, 'max': 1}
+
+    Map.addLayer(sentinel_image, vis_params, 'Dataset Preview')
     Map
 
 
 
-def export_to_google(sentinel_image):
+
+
+def export_to_google(sentinel_image, aoi, description='sentinel_export', folder='earth_engine_exports'):
+    # Check if the image exists and has bands
+    if sentinel_image is None:
+        raise ValueError("The provided image is None. Check your filters or image collection.")
+    
+    band_names = sentinel_image.bandNames().getInfo()
+    if not band_names:
+        raise ValueError("The image has no bands. Verify the dataset and filters.")
+    
+    print("Available bands:", band_names)
+
+    # Automatically select suitable bands
+    if set(['B4', 'B3', 'B2']).issubset(band_names):
+        image_to_export = sentinel_image.select(['B4', 'B3', 'B2'])  # Sentinel-2 RGB
+        scale = 10
+    elif set(['VV', 'VH']).intersection(band_names):
+        image_to_export = sentinel_image.select(['VV'])  # Sentinel-1 backscatter
+        scale = 10
+    elif len(band_names) == 1:
+        # Single-band datasets like GHSL or settlement maps
+        image_to_export = sentinel_image.select(band_names[0])
+        scale = 30
+    else:
+        # Fall back to the first three available bands
+        image_to_export = sentinel_image.select(band_names[:3])
+        scale = 30
+
+    # Define region and start export
+    region_coords = aoi.bounds().getInfo()['coordinates']
+
     task = ee.batch.Export.image.toDrive(
-    image=sentinel_image.select(['B4', 'B3', 'B2']),
-    description='sentinel_export',
-    folder='earth_engine_exports',
-    fileNamePrefix='my_aoi_image',
-    region=aoi.bounds().getInfo()['coordinates'],
-    scale=10,
-    crs='EPSG:4326',
-    maxPixels=1e13
+        image=image_to_export,
+        description=description,
+        folder=folder,
+        fileNamePrefix='my_aoi_image.tif',
+        region=region_coords,
+        scale=scale,
+        crs='EPSG:4326',
+        maxPixels=1e13
     )
     task.start()
-    print('Export task started. Check your Google Drive for the image.')
-    while task.status()['state'] in ['READY', 'RUNNING']:
-        print('Task is', task.status()['state'])    
-        time.sleep(2)  # wait 10 seconds before checking again
+    print(f"✅ Export task '{description}' started...")
 
-    print('Task finished with state:', task.status()['state'])
-    if task.status()['state'] == 'COMPLETED':
-        print('Export succeeded! Check your Google Drive folder.')
+    # Monitor progress
+    while task.status()['state'] in ['READY', 'RUNNING']:
+        print('Task is', task.status()['state'])
+        time.sleep(5)
+
+    state = task.status()['state']
+    print(f"Task finished with state: {state}")
+    if state == 'COMPLETED':
+        print("🎉 Export succeeded! Check your Google Drive folder.")
     else:
-        print('Export failed or was cancelled:', task.status())
+        print("❌ Export failed or was cancelled:", task.status())
+
 
 
 
@@ -168,13 +234,14 @@ def tile_and_save(img, tile_size=640, overlap=0, save_dir='./yolov5/data/images/
 
 
 def run_inference():
-    # Load model
     model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+    model.to('cuda')  # use GPU
+    results = model('yolov5/data/images/images.jpeg')
+    #image_paths = glob(os.path.join('yolov5/data/images/test', '*.jpg'))
 
-    # Inference on an image or folder of images
-    results = model('./yolov5/data/images/test')
+    # Run inference on all images
+    # results = model(image_paths)
 
-    # Print results
     results.print()
 
     # Save results (images with bounding boxes)
@@ -184,26 +251,112 @@ def run_inference():
     df = results.pandas().xyxy[0]
     print(df)
 
+
+
+def run_inference_cpu():
+    # Load YOLOv5s model
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+    model.to('cpu')  # or 'cuda' if you have a GPU
+
+    # Get all image files in directory (jpg, png, jpeg)
+    image_dir = 'yolov5/data/images/test'
+    image_paths = glob(os.path.join(image_dir, '*.*'))  # matches any file type
+
+    # Filter only supported image types (optional)
+    image_paths = [p for p in image_paths if p.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    print(f"Found {len(image_paths)} images")
+    
+    # Run inference on all images
+    results = model(image_paths)
+
+    # Print summary
+    results.print()
+
+    # Save annotated results (images with boxes)
+    results.save(save_dir='runs/detect/cpu_inference')
+
+    # Access detections as pandas dataframe
+    for i, path in enumerate(image_paths):
+        print(f"\nResults for: {path}")
+        print(results.pandas().xyxy[i])  # bounding boxes per image
+
+
+
+def detect_rectangles(image_dir):
+    # Get all image files (jpg, png, jpeg)
+    image_paths = glob(os.path.join(image_dir, '*.*'))
+    image_paths = [p for p in image_paths if p.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    print(f"Found {len(image_paths)} images in '{image_dir}'")
+
+    # Output folder
+    output_dir = os.path.join(image_dir, 'rectangles_output')
+    os.makedirs(output_dir, exist_ok=True)
+
+    for path in image_paths:
+        print(f"Processing: {os.path.basename(path)}")
+
+        # Read and process image
+        image = cv2.imread(path)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 50, 150)
+
+        # Find contours
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Loop through contours
+        for contour in contours:
+            # Approximate the contour to a polygon
+            approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+
+            # A rectangle has 4 sides
+            if len(approx) == 4:
+                x, y, w, h = cv2.boundingRect(approx)
+                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        # Save the image with detected rectangles
+        output_path = os.path.join(output_dir, os.path.basename(path))
+        cv2.imwrite(output_path, image)
+
+        print(f"Saved result to: {output_path}")
+
+    print("✅ Rectangle detection complete!")
+
+
 def main():
-    print("authenticating and init....")
-    auth()
-    #print("defining area")
-    #aoi = define_area()
-    #print("loading iamge")
-    #sentinel_image = load_sentinel_imagery(aoi)
-    # visualize(sentinel_image)
-    # print("exporting to google drive")
-    # export_to_google(sentinel_image)
-    # print("downloading locally")
-    # download_local(aoi, sentinel_image) #only works with small files sub 300mb
+    choice = input("download image? y/n")
+    if choice == 'y':
+            
+        print("authenticating and init....")
+        auth()
+        print("defining area")
+        aoi = define_area()
+        print("loading image")
+        sentinel_image = load_sentinel_imagery(aoi)
+        visualize(sentinel_image)
+        print("exporting to google drive")
+        export_to_google(sentinel_image, aoi)
+        # print("downloading locally")
+        # download_local(aoi, sentinel_image) #only works with small files sub 300mb
+    else:
+        pass
 
-    print("loading local image 'my_aoi_image.tif' from working dir")
-    img, profile = load_local_image()
-    print("tiling image")
-    tile_and_save(img)
+    choice2 = input("procces image? y/n")
+    if choice == 'y':
+        print("loading local image 'my_aoi_image.tif' from working dir")
+        img, profile = load_local_image()
+        print("tiling image")
+        tile_and_save(img)
+        print("open cv dectecing rectangles")
+        detect_rectangles("yolov5/data/images/test")
+        # print("detecting objects")
+        # run_inference()
 
-    # print("detecting objects")
-    # run_inference()
+        # print("detecting objects")
+        # run_inference_cpu()
+    else:
+        return
 
 main()
-
